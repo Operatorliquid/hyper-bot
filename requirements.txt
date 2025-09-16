@@ -4,3 +4,4 @@ python-dotenv==1.0.1
 websocket-client==1.8.0
 eth-account==0.10.0
 hyperliquid==0.4.66
++ hyperliquid-python-sdk==0.19.0
