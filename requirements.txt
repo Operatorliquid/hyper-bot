@@ -1,0 +1,6 @@
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
+python-dotenv==1.0.1
+websocket-client==1.8.0
+eth-account==0.10.0
+hyperliquid==0.4.66
