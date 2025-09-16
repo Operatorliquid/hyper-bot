@@ -1,22 +1,21 @@
 # webui/app.py
 import os, sys, threading, logging
-from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, Request
+from typing import Optional, List
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Permite importar "src"
+# Permitir importar desde /src
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from src.maker_bot import MakerBot, BotArgs, HLConfig, ExchangeAdapter  # usa tu código existente
+from src.maker_bot import MakerBot, BotArgs, HLConfig, ExchangeAdapter  # tu bot y adapter
 
 # ---------- FastAPI ----------
 app = FastAPI()
 
-# CORS: permití tu dominio del front (Hostinger)
+# CORS: dominios de tu front (Hostinger), vienen por env ALLOW_ORIGINS
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*")
 origins = [o.strip() for o in ALLOW_ORIGINS.split(",")] if ALLOW_ORIGINS else ["*"]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -25,14 +24,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- Estado global simple ----------
+# ---------- Auth (token) para /start y /stop ----------
+AUTH = os.getenv("WEBUI_AUTH_TOKEN", "").strip()
+
+@app.middleware("http")
+async def require_token(request, call_next):
+    if AUTH and request.url.path in ("/start", "/stop"):
+        auth = request.headers.get("authorization", "")
+        if auth != f"Bearer {AUTH}":
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
+# ---------- Estado global (sesión única) ----------
 BOT_THREAD: Optional[threading.Thread] = None
 BOT_INST: Optional[MakerBot] = None
 LOGS: List[str] = []
 LOGS_MAX = 2000
 LOG_LOCK = threading.Lock()
 
-# Capturamos logs del bot
+# Capturar logs del bot en memoria
 bot_logger = logging.getLogger("maker_bot")
 class ListHandler(logging.Handler):
     def emit(self, record):
@@ -42,11 +52,11 @@ class ListHandler(logging.Handler):
             if len(LOGS) > LOGS_MAX:
                 del LOGS[: len(LOGS) - LOGS_MAX]
 bot_handler = ListHandler()
-bot_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+bot_handler.setFormatter(logging.Formatter("%Y-%m-%d %H:%M:%S %(levelname)s %(message)s"))
 bot_logger.addHandler(bot_handler)
 bot_logger.setLevel(logging.INFO)
 
-# ---------- Entrada ----------
+# ---------- Payload ----------
 class StartPayload(BaseModel):
     ticker: str
     amount_per_level: float
@@ -54,7 +64,8 @@ class StartPayload(BaseModel):
     ttl: float
     maker_only: bool = True
     testnet: bool = False
-    # Agent mode: la clave viene por ENV (AGENT_PRIVATE_KEY)
+    # BYO-agent: el usuario puede enviar su agent key en el body
+    agent_private_key: Optional[str] = None
 
 # ---------- Endpoints ----------
 @app.get("/status")
@@ -72,18 +83,22 @@ def get_logs(since: int = 0):
 def _run_bot(p: StartPayload):
     global BOT_INST
     try:
-        agent_pk = (os.getenv("AGENT_PRIVATE_KEY", "")).strip()
+        # 1) Elegir clave del agente: primero la que viene del usuario; si no, la de env (opcional)
+        agent_pk = (p.agent_private_key or os.getenv("AGENT_PRIVATE_KEY", "")).strip()
         if not agent_pk:
-            bot_logger.error("Falta AGENT_PRIVATE_KEY en variables de entorno")
+            bot_logger.error("Falta agent_private_key (en el body o env AGENT_PRIVATE_KEY)")
             return
 
+        # 2) Configurar adapter en modo agente
         cfg = HLConfig(
-            private_key=None,       # agent-only
+            private_key=None,        # no usamos HL_PRIVATE_KEY
             use_testnet=p.testnet,
             use_agent=True,
             agent_private_key=agent_pk,
         )
         adapter = ExchangeAdapter(cfg)
+
+        # 3) Args del bot
         args = BotArgs(
             ticker=p.ticker,
             amount_per_level=p.amount_per_level,
@@ -95,11 +110,12 @@ def _run_bot(p: StartPayload):
             agent_private_key=agent_pk,
         )
 
+        # 4) Iniciar bot
         bot = MakerBot(adapter, args)
         BOT_INST = bot
         bot.resolve_coin()
         bot.start_ws()
-        bot.loop()   # se corta cuando bot.stop_event.set()
+        bot.loop()  # se detiene cuando bot.stop_event.set()
     except Exception as e:
         bot_logger.error(f"[WEB] bot crashed: {e}")
     finally:
@@ -122,7 +138,7 @@ def stop_bot():
     global BOT_THREAD, BOT_INST
     if BOT_INST is not None:
         try:
-            BOT_INST.stop_event.set()  # requiere que tu MakerBot tenga stop_event
+            BOT_INST.stop_event.set()  # tu MakerBot ya lo tiene
         except Exception:
             pass
     return {"ok": True}
