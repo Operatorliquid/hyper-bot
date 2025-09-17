@@ -1,7 +1,7 @@
 # webui/app.py
 from __future__ import annotations
 
-import os, sys, json, signal, time, threading, subprocess
+import os, sys, signal, time, threading, subprocess
 from pathlib import Path
 from typing import List, Optional
 
@@ -156,25 +156,9 @@ async def logs(since: int = 0):
     # simple: devuelve todo y el next
     return {"next": LOG_NEXT, "lines": LOGS}
 
-# <<< ÚNICO CAMBIO: /start acepta JSON y text/plain con JSON >>>
 @app.post("/start", dependencies=[Depends(auth_dep)])
-async def start(request: Request):
+async def start(payload: dict = Body(...)):
     try:
-        ct = request.headers.get("content-type", "")
-        if "application/json" in ct:
-            payload = await request.json()
-        else:
-            raw = await request.body()
-            if isinstance(raw, (bytes, bytearray)):
-                raw = raw.decode("utf-8", "ignore")
-            try:
-                payload = json.loads(raw or "{}")
-            except Exception:
-                return JSONResponse(
-                    status_code=422,
-                    content={"ok": False, "error": "Body debe ser JSON (string)"},
-                )
-
         start_bot(payload)
         return {"ok": True}
     except Exception as e:
