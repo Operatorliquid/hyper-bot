@@ -1,144 +1,248 @@
 # webui/app.py
-import os, sys, threading, logging
-from typing import Optional, List
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from __future__ import annotations
+
+import os
+import sys
+import json
+import signal
+import time
+import threading
+import subprocess
+from pathlib import Path
+from typing import List, Optional
+
+from fastapi import FastAPI, Depends, HTTPException, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
 
-# Permitir importar desde /src
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from src.maker_bot import MakerBot, BotArgs, HLConfig, ExchangeAdapter  # tu bot y adapter
-
-# ---------- FastAPI ----------
+# -----------------------------------------------------------------------------
+# CORS configurable por variables de entorno (Railway → Variables)
+# -----------------------------------------------------------------------------
 app = FastAPI()
 
-# CORS: dominios de tu front (Hostinger), vienen por env ALLOW_ORIGINS
-ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*")
-origins = [o.strip() for o in ALLOW_ORIGINS.split(",")] if ALLOW_ORIGINS else ["*"]
+allow_origins = [o.strip() for o in os.getenv("ALLOW_ORIGINS", "*").split(",") if o.strip()]
+allow_headers = [h.strip() for h in os.getenv("ALLOW_HEADERS", "*").split(",") if h.strip()]
+allow_methods = [m.strip() for m in os.getenv("ALLOW_METHODS", "*").split(",") if m.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=allow_origins or ["*"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=allow_methods or ["*"],
+    allow_headers=allow_headers or ["*"],
 )
 
-# ---------- Auth (token) para /start y /stop ----------
-AUTH = os.getenv("WEBUI_AUTH_TOKEN", "").strip()
+# -----------------------------------------------------------------------------
+# Auth: token simple para /start y /stop. NO bloquea OPTIONS (preflight)
+# -----------------------------------------------------------------------------
+WEB_TOKEN = os.getenv("WEBUI_AUTH_TOKEN", "").strip()
 
-@app.middleware("http")
-async def require_token(request, call_next):
-    if AUTH and request.url.path in ("/start", "/stop"):
-        auth = request.headers.get("authorization", "")
-        if auth != f"Bearer {AUTH}":
-            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-    return await call_next(request)
+async def auth_dep(request: Request):
+    # Dejar pasar el preflight
+    if request.method == "OPTIONS":
+        return
+    # Aceptar Authorization: Bearer <token> o X-Auth-Token: <token>
+    auth = request.headers.get("Authorization", "")
+    xauth = request.headers.get("X-Auth-Token", "")
+    bearer = auth.split("Bearer ", 1)[1].strip() if auth.startswith("Bearer ") else ""
+    token = bearer or xauth
+    if not WEB_TOKEN or token != WEB_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
 
-# ---------- Estado global (sesión única) ----------
-BOT_THREAD: Optional[threading.Thread] = None
-BOT_INST: Optional[MakerBot] = None
+# -----------------------------------------------------------------------------
+# Estado global del subproceso (bot) y captura de logs
+# -----------------------------------------------------------------------------
+BOT_PROC: Optional[subprocess.Popen] = None
+BOT_LOCK = threading.Lock()
+
 LOGS: List[str] = []
-LOGS_MAX = 2000
-LOG_LOCK = threading.Lock()
+LOG_NEXT = 0
+MAX_LOGS = 4000
 
-# Capturar logs del bot en memoria
-bot_logger = logging.getLogger("maker_bot")
-class ListHandler(logging.Handler):
-    def emit(self, record):
-        msg = self.format(record)
-        with LOG_LOCK:
-            LOGS.append(msg)
-            if len(LOGS) > LOGS_MAX:
-                del LOGS[: len(LOGS) - LOGS_MAX]
-bot_handler = ListHandler()
-bot_handler.setFormatter(logging.Formatter("%Y-%m-%d %H:%M:%S %(levelname)s %(message)s"))
-bot_logger.addHandler(bot_handler)
-bot_logger.setLevel(logging.INFO)
+def _append_log(line: str):
+    global LOGS, LOG_NEXT
+    line = line.rstrip("\n")
+    LOGS.append(line)
+    LOG_NEXT += 1
+    if len(LOGS) > MAX_LOGS:
+        # recorta para no crecer indefinidamente
+        excess = len(LOGS) - MAX_LOGS
+        LOGS = LOGS[excess:]
+        # LOG_NEXT sigue contando globalmente; el cliente usa 'since' y 'next'
 
-# ---------- Payload ----------
-class StartPayload(BaseModel):
-    ticker: str
-    amount_per_level: float
-    min_spread: float
-    ttl: float
-    maker_only: bool = True
-    testnet: bool = False
-    # BYO-agent: el usuario puede enviar su agent key en el body
-    agent_private_key: Optional[str] = None
-
-# ---------- Endpoints ----------
-@app.get("/status")
-def status():
-    running = BOT_THREAD is not None and BOT_THREAD.is_alive()
-    return {"running": running}
-
-@app.get("/logs")
-def get_logs(since: int = 0):
-    with LOG_LOCK:
-        items = LOGS[since:]
-        nxt = since + len(items)
-    return {"next": nxt, "lines": items}
-
-def _run_bot(p: StartPayload):
-    global BOT_INST
+def _reader_thread(stream, tag: str):
+    for raw in iter(stream.readline, ""):
+        if not raw:
+            break
+        _append_log(raw.rstrip("\n"))
     try:
-        # 1) Elegir clave del agente: primero la que viene del usuario; si no, la de env (opcional)
-        agent_pk = (p.agent_private_key or os.getenv("AGENT_PRIVATE_KEY", "")).strip()
-        if not agent_pk:
-            bot_logger.error("Falta agent_private_key (en el body o env AGENT_PRIVATE_KEY)")
-            return
+        stream.close()
+    except Exception:
+        pass
+    _append_log(f"[{tag}] closed")
 
-        # 2) Configurar adapter en modo agente
-        cfg = HLConfig(
-            private_key=None,        # no usamos HL_PRIVATE_KEY
-            use_testnet=p.testnet,
-            use_agent=True,
-            agent_private_key=agent_pk,
+def _start_reader_threads(proc: subprocess.Popen):
+    t1 = threading.Thread(target=_reader_thread, args=(proc.stdout, "STDOUT"), daemon=True)
+    t1.start()
+
+# -----------------------------------------------------------------------------
+# Helpers para lanzar/detener el bot
+# -----------------------------------------------------------------------------
+def is_running() -> bool:
+    with BOT_LOCK:
+        return BOT_PROC is not None and BOT_PROC.poll() is None
+
+def start_bot_subprocess(payload: dict):
+    """
+    Lanza `python -m src.maker_bot` con los flags que venís usando, pasando
+    el agente que crea el front (agent_private_key).
+    """
+    global BOT_PROC
+    with BOT_LOCK:
+        if is_running():
+            raise RuntimeError("bot ya está corriendo")
+
+        # Validación mínima
+        ticker = str(payload.get("ticker", "UBTC/USDC"))
+        amount = float(payload.get("amount_per_level", 5))
+        min_spread = float(payload.get("min_spread", 0.05))
+        ttl = float(payload.get("ttl", 20))
+        maker_only = bool(payload.get("maker_only", False))
+        testnet = bool(payload.get("testnet", False))
+        agent_pk = str(payload.get("agent_private_key", "")).strip()
+
+        if not agent_pk or not agent_pk.startswith("0x") or len(agent_pk) != 66:
+            raise ValueError("agent_private_key inválida")
+
+        # Comando: python -m src.maker_bot ...
+        # Tu maker_bot ya acepta estos flags (— los definiste en argparse):
+        # --ticker/--symbol, --amount-per-level, --min-spread, --ttl,
+        # --maker-only, --testnet, --use-agent, --agent-private-key
+        cmd = [
+            sys.executable, "-m", "src.maker_bot",
+            "--ticker", ticker,
+            "--amount-per-level", str(amount),
+            "--min-spread", str(min_spread),
+            "--ttl", str(ttl),
+            "--agent-private-key", agent_pk,
+            "--use-agent",
+        ]
+        if maker_only:
+            cmd.append("--maker-only")
+        if testnet:
+            cmd.append("--testnet")
+
+        # Working dir = raíz del proyecto (donde está src/)
+        base_dir = Path(__file__).resolve().parents[1]
+
+        # IMPORTANTE: no agregamos headers ni nada aquí; eso es en el front
+        env = os.environ.copy()
+        # Si tu maker_bot todavía chequea HL_PRIVATE_KEY, puedes dejar una vacía
+        # o setear alguna (no se usará cuando --use-agent). Idealmente tu bot ya NO lo requiere.
+        env.setdefault("HL_PRIVATE_KEY", "")
+
+        BOT_PROC = subprocess.Popen(
+            cmd,
+            cwd=str(base_dir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
         )
-        adapter = ExchangeAdapter(cfg)
+        _append_log(f"[WEB] launch: {' '.join(cmd)}")
+        _start_reader_threads(BOT_PROC)
 
-        # 3) Args del bot
-        args = BotArgs(
-            ticker=p.ticker,
-            amount_per_level=p.amount_per_level,
-            min_spread=p.min_spread,
-            maker_only=p.maker_only,
-            ttl=p.ttl,
-            use_testnet=p.testnet,
-            use_agent=True,
-            agent_private_key=agent_pk,
-        )
+def stop_bot_subprocess(timeout: float = 8.0):
+    global BOT_PROC
+    with BOT_LOCK:
+        if BOT_PROC is None:
+            return False
+        if BOT_PROC.poll() is not None:
+            BOT_PROC = None
+            return True
 
-        # 4) Iniciar bot
-        bot = MakerBot(adapter, args)
-        BOT_INST = bot
-        bot.resolve_coin()
-        bot.start_ws()
-        bot.loop()  # se detiene cuando bot.stop_event.set()
-    except Exception as e:
-        bot_logger.error(f"[WEB] bot crashed: {e}")
-    finally:
-        BOT_INST = None
-        bot_logger.info("[WEB] bot stopped")
-
-@app.post("/start")
-def start_bot(p: StartPayload):
-    global BOT_THREAD, BOT_INST
-    if BOT_THREAD and BOT_THREAD.is_alive():
-        return JSONResponse({"ok": False, "error": "bot ya está corriendo"}, status_code=400)
-    with LOG_LOCK:
-        LOGS.clear()
-    BOT_THREAD = threading.Thread(target=_run_bot, args=(p,), daemon=True)
-    BOT_THREAD.start()
-    return {"ok": True}
-
-@app.post("/stop")
-def stop_bot():
-    global BOT_THREAD, BOT_INST
-    if BOT_INST is not None:
+        # Primero, SIGINT (equivale a Ctrl+C) → tu MakerBot captura KeyboardInterrupt
         try:
-            BOT_INST.stop_event.set()  # tu MakerBot ya lo tiene
+            BOT_PROC.send_signal(signal.SIGINT)
         except Exception:
             pass
-    return {"ok": True}
+
+        # Espera un poco
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if BOT_PROC.poll() is not None:
+                BOT_PROC = None
+                return True
+            time.sleep(0.2)
+
+        # Segundo intento: SIGTERM
+        try:
+            BOT_PROC.terminate()
+        except Exception:
+            pass
+
+        t1 = time.time()
+        while time.time() - t1 < 5.0:
+            if BOT_PROC.poll() is not None:
+                BOT_PROC = None
+                return True
+            time.sleep(0.2)
+
+        # Último recurso: SIGKILL
+        try:
+            BOT_PROC.kill()
+        except Exception:
+            pass
+        BOT_PROC = None
+        return True
+
+# -----------------------------------------------------------------------------
+# Rutas públicas
+# -----------------------------------------------------------------------------
+@app.get("/status")
+async def status():
+    return {"running": is_running()}
+
+@app.get("/logs")
+async def logs(since: int = 0):
+    # Devuelve desde 'since' (índice) hacia adelante
+    # El cliente guardará 'next' y vuelve a pedir desde ahí.
+    start = max(0, since)
+    # next es el siguiente índice global (LOG_NEXT)
+    lines = LOGS[start - (LOG_NEXT - len(LOGS)):] if start < LOG_NEXT else []
+    return {"next": LOG_NEXT, "lines": lines}
+
+# -----------------------------------------------------------------------------
+# Rutas protegidas (auth por token)
+# -----------------------------------------------------------------------------
+@app.post("/start", dependencies=[Depends(auth_dep)])
+async def start(payload: dict = Body(...)):
+    try:
+        start_bot_subprocess(payload)
+        return {"ok": True}
+    except Exception as e:
+        _append_log(f"[WEB][START][ERR] {e}")
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+
+@app.post("/stop", dependencies=[Depends(auth_dep)])
+async def stop():
+    try:
+        ok = stop_bot_subprocess()
+        return {"ok": ok}
+    except Exception as e:
+        _append_log(f"[WEB][STOP][ERR] {e}")
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+
+# -----------------------------------------------------------------------------
+# (Opcional) Entrypoint local
+# Railway usa tu Procfile: `web: uvicorn webui.app:app --host 0.0.0.0 --port $PORT`
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "webui.app:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        reload=bool(os.getenv("DEV_RELOAD", "0") == "1")
+    )
