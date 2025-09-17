@@ -1,184 +1,167 @@
-# webui/app.py
-from __future__ import annotations
+// ============================
+// Based Maker — Frontend JS
+// ============================
+const API_BASE   = "https://web-production-626a.up.railway.app"; // tu Railway
+const AUTH_TOKEN = "un_token_largo";                              // = WEBUI_AUTH_TOKEN
 
-import os, sys, signal, time, threading, subprocess
-from pathlib import Path
-from typing import List, Optional
+// SDKs
+import * as hl from "https://esm.sh/@nktkas/hyperliquid@0.24.3";
+import { createWalletClient, custom } from "https://esm.sh/viem@2.21.23";
+import { privateKeyToAccount }       from "https://esm.sh/viem@2.21.23/accounts";
 
-from fastapi import FastAPI, Depends, HTTPException, Request, Body, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+let nextIdx = 0;
 
-app = FastAPI(title="based-maker-webui")
+function setText(id, txt){ const el=document.getElementById(id); if(el) el.textContent=txt; }
+function logLine(s){
+  const el = document.getElementById('logs');
+  if(!el) return;
+  el.textContent += (el.textContent ? "\n" : "") + s;
+  el.scrollTop = el.scrollHeight;
+}
+function updateButtons(){
+  const hasWallet = !!document.getElementById('walLocal').dataset.addr;
+  const agentOk   = document.getElementById('agentState').dataset.ok === "1";
+  document.getElementById('btnStart').disabled = !(hasWallet && agentOk);
+  document.getElementById('btnStop').disabled  = !hasWallet;
+}
 
-# ---------- CORS (abierto para test; luego restringí ORIGINS/HEADERS/METHODS) ----------
-allow_origins = [o.strip() for o in os.getenv("ALLOW_ORIGINS", "*").split(",") if o.strip()]
-allow_headers = [h.strip() for h in os.getenv("ALLOW_HEADERS", "*").split(",") if h.strip()]
-allow_methods = [m.strip() for m in os.getenv("ALLOW_METHODS", "*").split(",") if m.strip()]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allow_origins or ["*"],
-    allow_credentials=False,                 # importante con "*"
-    allow_methods=allow_methods or ["*"],
-    allow_headers=allow_headers or ["*"],
-)
+// ---- agente en localStorage ----
+function lsKey(addr){ return `agent:${addr.toLowerCase()}`; }
+function getSavedAgent(addr){ try { return JSON.parse(localStorage.getItem(lsKey(addr)) || "null"); } catch { return null; } }
+function saveAgent(addr, obj){ localStorage.setItem(lsKey(addr), JSON.stringify(obj)); }
+function markAgent(ok, msg){
+  const el = document.getElementById('agentState');
+  el.dataset.ok = ok ? "1" : "0";
+  el.innerHTML = ok ? `<span class="ok">Agente listo</span> · ${msg||''}` : `<span class="warn">Agente no listo</span> · ${msg||''}`;
+  updateButtons();
+}
 
-WEB_TOKEN = os.getenv("WEBUI_AUTH_TOKEN", "").strip()
+// ---- API simple (sin preflight): /status y /logs GET, start/stop con ?token= y body text/plain ----
+async function fetchStatus(){
+  try{
+    const r = await fetch(`${API_BASE}/status`, { method:'GET' });
+    const j = await r.json();
+    setText('running', j.running ? 'corriendo' : 'parado');
+  }catch{ setText('running','offline'); }
+}
+async function pollLogs(){
+  try{
+    const r = await fetch(`${API_BASE}/logs?since=${nextIdx}`, { method:'GET' });
+    const j = await r.json();
+    nextIdx = j.next || 0;
+    if (j.lines?.length){
+      const el = document.getElementById('logs');
+      el.textContent += "\n" + j.lines.join("\n");
+      el.scrollTop = el.scrollHeight;
+    }
+  }catch{}
+}
 
-# ---------- Estado subproceso + logs en memoria ----------
-BOT_PROC: Optional[subprocess.Popen] = None
-BOT_LOCK = threading.Lock()
-LOGS: List[str] = []
-LOG_NEXT = 0
-MAX_LOGS = 4000
+// ---- asegurar Mainnet para approveAgent ----
+async function ensureMainnet(){
+  const hex = await window.ethereum.request({ method: "eth_chainId" });
+  if (hex !== "0x1"){
+    await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0x1" }] });
+  }
+}
 
-def _append_log(line: str):
-    global LOGS, LOG_NEXT
-    line = line.rstrip("\n")
-    LOGS.append(line)
-    LOG_NEXT += 1
-    if len(LOGS) > MAX_LOGS:
-        LOGS[:] = LOGS[-MAX_LOGS:]
+// ---- crear + autorizar agente (1 firma) ----
+async function ensureAgentFor(userAddr){
+  const saved = getSavedAgent(userAddr);
+  if (saved?.pk && saved?.agent && /^0x[0-9a-fA-F]{64}$/.test(saved.pk)){
+    markAgent(true, `agent ${saved.agent.slice(0,6)}…${saved.agent.slice(-4)} (local)`);
+    return saved;
+  }
 
-def _reader_thread(stream):
-    for raw in iter(stream.readline, ""):
-        if not raw:
-            break
-        _append_log(raw.rstrip("\n"))
-    try:
-        stream.close()
-    except Exception:
-        pass
-    _append_log("[STDOUT] closed")
+  logLine(`[AGENT] Generando agente local…`);
+  const bytes = new Uint8Array(32); crypto.getRandomValues(bytes);
+  const pk = "0x" + Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join('');
+  const acc = privateKeyToAccount(pk);
+  const agentAddress = acc.address;
 
-def _start_reader(proc: subprocess.Popen):
-    t = threading.Thread(target=_reader_thread, args=(proc.stdout,), daemon=True)
-    t.start()
+  logLine(`[AGENT] Autorizando agente ${agentAddress} en Hyperliquid…`);
+  if (!window.ethereum) throw new Error("MetaMask no detectado");
 
-def is_running() -> bool:
-    with BOT_LOCK:
-        return BOT_PROC is not None and BOT_PROC.poll() is None
+  const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+  const primary  = accounts[0];
+  await ensureMainnet();
 
-# ---------- Auth (acepta header o ?token=...) ----------
-async def auth_dep(request: Request, token: Optional[str] = Query(default=None)):
-    if request.method == "OPTIONS":
-        return
-    hdr = request.headers.get("Authorization", "")
-    xhdr = request.headers.get("X-Auth-Token", "")
-    bearer = hdr.split("Bearer ", 1)[1].strip() if hdr.startswith("Bearer ") else ""
-    provided = token or bearer or xhdr
-    if not WEB_TOKEN or provided != WEB_TOKEN:
-        raise HTTPException(401, "unauthorized")
+  const walletClient = createWalletClient({ transport: custom(window.ethereum) });
+  const walletForHL = {
+    signMessage:   (args) => walletClient.signMessage({ ...args, account: primary }),
+    signTypedData: (args) => walletClient.signTypedData({ ...args, account: primary }),
+    getAddress: async () => primary,
+  };
+  const transport = new hl.HttpTransport({ url: "https://api.hyperliquid.xyz" });
+  const exchange  = new hl.ExchangeClient({ wallet: walletForHL, transport });
 
-# ---------- Lanzar / parar bot ----------
-def start_bot(payload: dict):
-    global BOT_PROC
-    with BOT_LOCK:
-        if is_running():
-            raise RuntimeError("bot ya está corriendo")
+  await exchange.approveAgent({ agentAddress }); // 1 firma
+  logLine(`[AGENT] Aprobado (${agentAddress}).`);
+  saveAgent(userAddr, { pk, agent: agentAddress, ts: Date.now() });
+  markAgent(true, `agent ${agentAddress.slice(0,6)}…${agentAddress.slice(-4)}`);
+  return { pk, agent: agentAddress };
+}
 
-        ticker      = str(payload.get("ticker", "UBTC/USDC"))
-        amount      = float(payload.get("amount_per_level", 5))
-        min_spread  = float(payload.get("min_spread", 0.05))
-        ttl         = float(payload.get("ttl", 20))
-        maker_only  = bool(payload.get("maker_only", False))
-        testnet     = bool(payload.get("testnet", False))
-        agent_pk    = str(payload.get("agent_private_key", "")).strip()
+// ---- Start/Stop SIN preflight (token por query + body text/plain) ----
+async function startBot(){
+  const addr  = document.getElementById('walLocal').dataset.addr;
+  const agent = getSavedAgent(addr);
+  if (!agent?.pk){ alert('Agente no listo. Reconectá la wallet.'); return; }
 
-        if not agent_pk or not agent_pk.startswith("0x") or len(agent_pk) != 66:
-            raise ValueError("agent_private_key inválida")
+  const payload = {
+    ticker: document.getElementById('ticker').value.trim(),
+    amount_per_level: parseFloat(document.getElementById('amount').value),
+    min_spread: parseFloat(document.getElementById('minspread').value),
+    ttl: parseFloat(document.getElementById('ttl').value),
+    maker_only: document.getElementById('maker').checked,
+    testnet: false,
+    agent_private_key: agent.pk
+  };
+  try{
+    const r = await fetch(`${API_BASE}/start?token=${encodeURIComponent(AUTH_TOKEN)}`, {
+      method:'POST',
+      headers: { 'Content-Type':'text/plain' },   // simple request → sin preflight
+      body: JSON.stringify(payload)
+    });
+    const txt = await r.text(); let j=null; try{ j=JSON.parse(txt); }catch{}
+    if (!r.ok || !j?.ok){ logLine(`[HTTP ${r.status}] ${txt.slice(0,300)}`); alert('No se pudo iniciar'); return; }
+    nextIdx = 0; document.getElementById('logs').textContent=''; await fetchStatus();
+    logLine(`[WEB] Bot iniciado.`);
+  }catch(e){ console.error(e); alert('Backend no disponible.'); }
+}
 
-        cmd = [
-            sys.executable, "-m", "src.maker_bot",
-            "--ticker", ticker,
-            "--amount-per-level", str(amount),
-            "--min-spread", str(min_spread),
-            "--ttl", str(ttl),
-            "--agent-private-key", agent_pk,
-            "--use-agent",
-        ]
-        if maker_only: cmd.append("--maker-only")
-        if testnet:    cmd.append("--testnet")
+async function stopBot(){
+  try{
+    const r = await fetch(`${API_BASE}/stop?token=${encodeURIComponent(AUTH_TOKEN)}`, {
+      method:'POST',
+      headers: { 'Content-Type':'text/plain' },
+      body: ""
+    });
+    await fetchStatus();
+    logLine(`[WEB] Bot detenido.`);
+  }catch(e){ console.error(e); }
+}
 
-        base_dir = Path(__file__).resolve().parents[1]
-        env = os.environ.copy()
-        env.setdefault("HL_PRIVATE_KEY", "")  # no se usa con --use-agent
+// ---- Conectar wallet ----
+async function connectWallet(){
+  if (!window.ethereum){ alert('Instalá MetaMask.'); return; }
+  try{
+    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    const addr = accounts[0];
+    const el = document.getElementById('walLocal');
+    el.textContent = `Wallet: ${addr}`; el.dataset.addr = addr;
+    await ensureAgentFor(addr);
+    updateButtons();
+  }catch(e){
+    console.error(e); logLine(`[ERROR] wallet/agent: ${e?.message||e}`); alert('No se pudo conectar/autorizar.');
+  }
+}
 
-        BOT_PROC = subprocess.Popen(
-            cmd, cwd=str(base_dir), env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
-        _append_log(f"[WEB] launch: {' '.join(cmd)}")
-        _start_reader(BOT_PROC)
+// ---- UI ----
+document.getElementById('btnConnect').addEventListener('click', connectWallet);
+document.getElementById('btnStart').addEventListener('click', startBot);
+document.getElementById('btnStop').addEventListener('click', stopBot);
 
-def stop_bot(timeout: float = 8.0):
-    global BOT_PROC
-    with BOT_LOCK:
-        if BOT_PROC is None:
-            return False
-        if BOT_PROC.poll() is not None:
-            BOT_PROC = None
-            return True
-        try: BOT_PROC.send_signal(signal.SIGINT)
-        except Exception: pass
-
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        with BOT_LOCK:
-            if BOT_PROC is None or BOT_PROC.poll() is not None:
-                BOT_PROC = None
-                return True
-        time.sleep(0.2)
-
-    with BOT_LOCK:
-        try: BOT_PROC.terminate()
-        except Exception: pass
-    time.sleep(1.5)
-    with BOT_LOCK:
-        if BOT_PROC and BOT_PROC.poll() is None:
-            try: BOT_PROC.kill()
-            except Exception: pass
-        BOT_PROC = None
-    return True
-
-# ---------- Rutas ----------
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "based-maker-webui", "ts": int(time.time())}
-
-@app.get("/status")
-async def status():
-    return {"running": is_running()}
-
-@app.get("/logs")
-async def logs(since: int = 0):
-    # simple: devuelve todo y el next
-    return {"next": LOG_NEXT, "lines": LOGS}
-
-@app.post("/start", dependencies=[Depends(auth_dep)])
-async def start(payload: dict = Body(...)):
-    try:
-        start_bot(payload)
-        return {"ok": True}
-    except Exception as e:
-        _append_log(f"[WEB][START][ERR] {e}")
-        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
-
-@app.post("/stop", dependencies=[Depends(auth_dep)])
-async def stop():
-    try:
-        ok = stop_bot()
-        return {"ok": ok}
-    except Exception as e:
-        _append_log(f"[WEB][STOP][ERR] {e}")
-        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "webui.app:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
-        reload=bool(os.getenv("DEV_RELOAD", "0") == "1")
-    )
+// ---- Init ----
+fetchStatus(); updateButtons();
+setInterval(() => { pollLogs(); fetchStatus(); }, 2000);
