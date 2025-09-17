@@ -27,7 +27,7 @@ allow_methods = [m.strip() for m in os.getenv("ALLOW_METHODS", "*").split(",") i
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins or ["*"],
-    allow_credentials=True,
+    allow_credentials=False,          # 👈 IMPORTANTE: desactiva credenciales para que ACAO no se rompa con "*"
     allow_methods=allow_methods or ["*"],
     allow_headers=allow_headers or ["*"],
 )
