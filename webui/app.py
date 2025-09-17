@@ -153,13 +153,12 @@ async def status():
 
 @app.get("/logs")
 async def logs(since: int = 0):
+    # simple: devuelve todo y el next
     return {"next": LOG_NEXT, "lines": LOGS}
 
+# <<< ÚNICO CAMBIO: /start acepta JSON y text/plain con JSON >>>
 @app.post("/start", dependencies=[Depends(auth_dep)])
 async def start(request: Request):
-    """
-    Acepta application/json o text/plain (string con JSON).
-    """
     try:
         ct = request.headers.get("content-type", "")
         if "application/json" in ct:
@@ -171,7 +170,10 @@ async def start(request: Request):
             try:
                 payload = json.loads(raw or "{}")
             except Exception:
-                return JSONResponse(status_code=422, content={"ok": False, "error": "Body debe ser JSON"})
+                return JSONResponse(
+                    status_code=422,
+                    content={"ok": False, "error": "Body debe ser JSON (string)"},
+                )
 
         start_bot(payload)
         return {"ok": True}
