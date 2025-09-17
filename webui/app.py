@@ -1,60 +1,33 @@
 # webui/app.py
 from __future__ import annotations
 
-import os
-import sys
-import json
-import signal
-import time
-import threading
-import subprocess
+import os, sys, signal, time, threading, subprocess
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, Depends, HTTPException, Request, Body
+from fastapi import FastAPI, Depends, HTTPException, Request, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-# -----------------------------------------------------------------------------
-# FastAPI + CORS
-# -----------------------------------------------------------------------------
 app = FastAPI(title="based-maker-webui")
 
-# Variables CORS (Railway → Variables)
+# ---------- CORS (abierto para test; luego restringí ORIGINS/HEADERS/METHODS) ----------
 allow_origins = [o.strip() for o in os.getenv("ALLOW_ORIGINS", "*").split(",") if o.strip()]
 allow_headers = [h.strip() for h in os.getenv("ALLOW_HEADERS", "*").split(",") if h.strip()]
 allow_methods = [m.strip() for m in os.getenv("ALLOW_METHODS", "*").split(",") if m.strip()]
-
-# Nota: credenciales OFF para que el navegador acepte '*' sin problemas.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins or ["*"],
-    allow_credentials=False,            # importante para evitar bloqueos con '*'
+    allow_credentials=False,                 # importante con "*"
     allow_methods=allow_methods or ["*"],
     allow_headers=allow_headers or ["*"],
 )
 
-# -----------------------------------------------------------------------------
-# Auth simple por token en /start y /stop (no bloquea OPTIONS/preflight)
-# -----------------------------------------------------------------------------
 WEB_TOKEN = os.getenv("WEBUI_AUTH_TOKEN", "").strip()
 
-async def auth_dep(request: Request):
-    if request.method == "OPTIONS":
-        return  # dejar pasar preflight
-    auth = request.headers.get("Authorization", "")
-    xauth = request.headers.get("X-Auth-Token", "")
-    bearer = auth.split("Bearer ", 1)[1].strip() if auth.startswith("Bearer ") else ""
-    token = bearer or xauth
-    if not WEB_TOKEN or token != WEB_TOKEN:
-        raise HTTPException(status_code=401, detail="unauthorized")
-
-# -----------------------------------------------------------------------------
-# Estado del subproceso (bot) + logs
-# -----------------------------------------------------------------------------
+# ---------- Estado subproceso + logs en memoria ----------
 BOT_PROC: Optional[subprocess.Popen] = None
 BOT_LOCK = threading.Lock()
-
 LOGS: List[str] = []
 LOG_NEXT = 0
 MAX_LOGS = 4000
@@ -65,10 +38,9 @@ def _append_log(line: str):
     LOGS.append(line)
     LOG_NEXT += 1
     if len(LOGS) > MAX_LOGS:
-        excess = len(LOGS) - MAX_LOGS
-        LOGS = LOGS[excess:]
+        LOGS[:] = LOGS[-MAX_LOGS:]
 
-def _reader_thread(stream, tag: str):
+def _reader_thread(stream):
     for raw in iter(stream.readline, ""):
         if not raw:
             break
@@ -77,32 +49,41 @@ def _reader_thread(stream, tag: str):
         stream.close()
     except Exception:
         pass
-    _append_log(f"[{tag}] closed")
+    _append_log("[STDOUT] closed")
 
-def _start_reader_threads(proc: subprocess.Popen):
-    t1 = threading.Thread(target=_reader_thread, args=(proc.stdout, "STDOUT"), daemon=True)
-    t1.start()
+def _start_reader(proc: subprocess.Popen):
+    t = threading.Thread(target=_reader_thread, args=(proc.stdout,), daemon=True)
+    t.start()
 
-# -----------------------------------------------------------------------------
-# Helpers run/stop
-# -----------------------------------------------------------------------------
 def is_running() -> bool:
     with BOT_LOCK:
         return BOT_PROC is not None and BOT_PROC.poll() is None
 
-def start_bot_subprocess(payload: dict):
+# ---------- Auth (acepta header o ?token=...) ----------
+async def auth_dep(request: Request, token: Optional[str] = Query(default=None)):
+    if request.method == "OPTIONS":
+        return
+    hdr = request.headers.get("Authorization", "")
+    xhdr = request.headers.get("X-Auth-Token", "")
+    bearer = hdr.split("Bearer ", 1)[1].strip() if hdr.startswith("Bearer ") else ""
+    provided = token or bearer or xhdr
+    if not WEB_TOKEN or provided != WEB_TOKEN:
+        raise HTTPException(401, "unauthorized")
+
+# ---------- Lanzar / parar bot ----------
+def start_bot(payload: dict):
     global BOT_PROC
     with BOT_LOCK:
         if is_running():
             raise RuntimeError("bot ya está corriendo")
 
-        ticker = str(payload.get("ticker", "UBTC/USDC"))
-        amount = float(payload.get("amount_per_level", 5))
-        min_spread = float(payload.get("min_spread", 0.05))
-        ttl = float(payload.get("ttl", 20))
-        maker_only = bool(payload.get("maker_only", False))
-        testnet = bool(payload.get("testnet", False))
-        agent_pk = str(payload.get("agent_private_key", "")).strip()
+        ticker      = str(payload.get("ticker", "UBTC/USDC"))
+        amount      = float(payload.get("amount_per_level", 5))
+        min_spread  = float(payload.get("min_spread", 0.05))
+        ttl         = float(payload.get("ttl", 20))
+        maker_only  = bool(payload.get("maker_only", False))
+        testnet     = bool(payload.get("testnet", False))
+        agent_pk    = str(payload.get("agent_private_key", "")).strip()
 
         if not agent_pk or not agent_pk.startswith("0x") or len(agent_pk) != 66:
             raise ValueError("agent_private_key inválida")
@@ -116,28 +97,22 @@ def start_bot_subprocess(payload: dict):
             "--agent-private-key", agent_pk,
             "--use-agent",
         ]
-        if maker_only:
-            cmd.append("--maker-only")
-        if testnet:
-            cmd.append("--testnet")
+        if maker_only: cmd.append("--maker-only")
+        if testnet:    cmd.append("--testnet")
 
         base_dir = Path(__file__).resolve().parents[1]
         env = os.environ.copy()
         env.setdefault("HL_PRIVATE_KEY", "")  # no se usa con --use-agent
 
         BOT_PROC = subprocess.Popen(
-            cmd,
-            cwd=str(base_dir),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            cmd, cwd=str(base_dir), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
         )
         _append_log(f"[WEB] launch: {' '.join(cmd)}")
-        _start_reader_threads(BOT_PROC)
+        _start_reader(BOT_PROC)
 
-def stop_bot_subprocess(timeout: float = 8.0):
+def stop_bot(timeout: float = 8.0):
     global BOT_PROC
     with BOT_LOCK:
         if BOT_PROC is None:
@@ -145,44 +120,29 @@ def stop_bot_subprocess(timeout: float = 8.0):
         if BOT_PROC.poll() is not None:
             BOT_PROC = None
             return True
+        try: BOT_PROC.send_signal(signal.SIGINT)
+        except Exception: pass
 
-        # Ctrl+C
-        try:
-            BOT_PROC.send_signal(signal.SIGINT)
-        except Exception:
-            pass
-
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            if BOT_PROC.poll() is not None:
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        with BOT_LOCK:
+            if BOT_PROC is None or BOT_PROC.poll() is not None:
                 BOT_PROC = None
                 return True
-            time.sleep(0.2)
+        time.sleep(0.2)
 
-        # SIGTERM
-        try:
-            BOT_PROC.terminate()
-        except Exception:
-            pass
-
-        t1 = time.time()
-        while time.time() - t1 < 5.0:
-            if BOT_PROC.poll() is not None:
-                BOT_PROC = None
-                return True
-            time.sleep(0.2)
-
-        # SIGKILL
-        try:
-            BOT_PROC.kill()
-        except Exception:
-            pass
+    with BOT_LOCK:
+        try: BOT_PROC.terminate()
+        except Exception: pass
+    time.sleep(1.5)
+    with BOT_LOCK:
+        if BOT_PROC and BOT_PROC.poll() is None:
+            try: BOT_PROC.kill()
+            except Exception: pass
         BOT_PROC = None
-        return True
+    return True
 
-# -----------------------------------------------------------------------------
-# Rutas (incluye "/" para que el root responda rápido)
-# -----------------------------------------------------------------------------
+# ---------- Rutas ----------
 @app.get("/")
 async def root():
     return {"ok": True, "service": "based-maker-webui", "ts": int(time.time())}
@@ -193,13 +153,13 @@ async def status():
 
 @app.get("/logs")
 async def logs(since: int = 0):
-    # next = índice global, lines = últimas líneas acumuladas
+    # simple: devuelve todo y el next
     return {"next": LOG_NEXT, "lines": LOGS}
 
 @app.post("/start", dependencies=[Depends(auth_dep)])
 async def start(payload: dict = Body(...)):
     try:
-        start_bot_subprocess(payload)
+        start_bot(payload)
         return {"ok": True}
     except Exception as e:
         _append_log(f"[WEB][START][ERR] {e}")
@@ -208,15 +168,12 @@ async def start(payload: dict = Body(...)):
 @app.post("/stop", dependencies=[Depends(auth_dep)])
 async def stop():
     try:
-        ok = stop_bot_subprocess()
+        ok = stop_bot()
         return {"ok": ok}
     except Exception as e:
         _append_log(f"[WEB][STOP][ERR] {e}")
         return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
 
-# -----------------------------------------------------------------------------
-# Entrypoint local (Railway usa Procfile)
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
